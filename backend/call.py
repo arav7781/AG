@@ -11,16 +11,11 @@ import base64
 from requests.auth import HTTPBasicAuth
 from google.cloud import texttospeech
 import json
-from functions_tools import synthesize_text,create_ultravox_call,fetch_twilio_media,is_injury_related,analyze_injury_with_streaming,save_injury_report
 
 # Load environment variables
 load_dotenv()
 
-# Configuration
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
-GROQ_API_KEY =  ""
-ULTRAVOX_API_KEY =  ""
+
 
 # Initialize clients
 groq_client = Groq(api_key=GROQ_API_KEY)
@@ -39,7 +34,7 @@ logging.basicConfig(
 
 ULTRAVOX_API_URL = 'https://api.ultravox.ai/api/calls'
 
-
+# Load prompt templates
 prompt_file_path = os.path.join(os.path.dirname(__file__), "prompt1.md")
 with open(prompt_file_path, "r") as file:
     PROMPT_TEMPLATE = file.read()
@@ -70,6 +65,119 @@ for directory in ['audio_files', 'injury_reports']:
 # Conversation state
 conversation_state = {}
 
+def create_ultravox_call(config):
+    """Create Ultravox call and get join URL"""
+    headers = {
+        'Content-Type': 'application/json',
+        'X-API-Key': ULTRAVOX_API_KEY
+    }
+    response = requests.post(ULTRAVOX_API_URL, json=config, headers=headers)
+    response.raise_for_status()
+    return response.json()
+
+def fetch_twilio_media(media_url, return_base64=False):
+    """Fetch media from Twilio and return as raw bytes or Base64-encoded string."""
+    try:
+        response = requests.get(
+            media_url,
+            auth=HTTPBasicAuth(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+            timeout=15
+        )
+        response.raise_for_status()
+        if return_base64:
+            content_type = response.headers.get('content-type', 'image/jpeg')
+            image_data = base64.b64encode(response.content).decode('utf-8')
+            return f"data:{content_type};base64,{image_data}"
+        else:
+            return response.content
+    except Exception as e:
+        logger.error(f"Failed to fetch media: {str(e)}")
+        return None
+
+def is_injury_related(image_description, user_message=""):
+    """Determine if an image or message is injury-related using AI"""
+    injury_keywords = [
+        'wound', 'cut', 'bruise', 'burn', 'scrape', 'scratch', 'injury', 'hurt', 'pain',
+        'bleeding', 'swollen', 'sprain', 'fracture', 'broken', 'dislocated', 'torn',
+        'rash', 'bite', 'sting', 'laceration', 'abrasion', 'contusion', 'trauma',
+        'accident', 'fall', 'hit', 'injured', 'medical', 'first aid', 'emergency'
+    ]
+    
+    text_to_check = f"{image_description} {user_message}".lower()
+    return any(keyword in text_to_check for keyword in injury_keywords)
+
+def analyze_injury_with_streaming(messages):
+    """Analyze injury using Groq streaming API"""
+    try:
+        completion = groq_client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=messages,
+            temperature=0.3,
+            max_completion_tokens=1024,
+            top_p=0.8,
+            stream=True,
+            stop=None,
+        )
+        
+        response_text = ""
+        for chunk in completion:
+            if chunk.choices[0].delta.content:
+                response_text += chunk.choices[0].delta.content
+        
+        return response_text.strip()
+    except Exception as e:
+        logger.error(f"Streaming analysis failed: {str(e)}")
+        return "Sorry, I couldn't analyze the image at this time. Please try again or consult a medical professional."
+
+def save_injury_report(sender_number, user_input, ai_response, image_data=None):
+    """Save injury consultation report"""
+    try:
+        report = {
+            'timestamp': datetime.now().isoformat(),
+            'sender': sender_number,
+            'user_input': user_input,
+            'ai_response': ai_response,
+            'has_image': image_data is not None
+        }
+        
+        filename = f"injury_reports/report_{sender_number.replace(':', '_')}_{datetime.now().timestamp()}.json"
+        with open(filename, 'w') as f:
+            json.dump(report, f, indent=2)
+        
+        logger.info(f"Injury report saved: {filename}")
+        return filename
+    except Exception as e:
+        logger.error(f"Failed to save injury report: {str(e)}")
+        return None
+
+def synthesize_text(text, language_code="en-US", voice_name="en-US-Wavenet-D", output_file="output.mp3"):
+    """Synthesize text to speech using Google Cloud TTS"""
+    try:
+        # Uncomment when Google Cloud TTS is properly configured
+        # input_text = texttospeech.SynthesisInput(text=text)
+        # voice = texttospeech.VoiceSelectionParams(
+        #     language_code=language_code,
+        #     name=voice_name
+        # )
+        # audio_config = texttospeech.AudioConfig(
+        #     audio_encoding=texttospeech.AudioEncoding.MP3
+        # )
+        # response = tts_client.synthesize_speech(
+        #     input=input_text,
+        #     voice=voice,
+        #     audio_config=audio_config
+        # )
+        # with open(os.path.join('audio_files', output_file), "wb") as out:
+        #     out.write(response.audio_content)
+        # logger.info(f"Audio content written to audio_files/{output_file}")
+        # return True
+        
+        # Placeholder for TTS functionality
+        logger.info("TTS functionality not configured")
+        return False
+    except Exception as e:
+        logger.error(f"TTS synthesis failed: {str(e)}")
+        return False
 
 @app.route("/whatsapp", methods=['POST'])
 def whatsapp_reply():
@@ -82,7 +190,7 @@ def whatsapp_reply():
 
         logger.info(f"Incoming message from {sender_number}: {incoming_msg}, Media: {media_url}")
         
-       
+        # Initialize conversation state
         if sender_number not in conversation_state:
             conversation_state[sender_number] = {
                 'history': [],
@@ -91,13 +199,14 @@ def whatsapp_reply():
                 'injury_consultations': 0
             }
 
+        # Handle reset command
         if incoming_msg.lower() in ["start over", "reset", "new consultation"]:
             conversation_state[sender_number]['history'] = []
             resp = MessagingResponse()
             resp.message("Conversation reset. Hello! I'm Tanya, your medical assistant at Symbiosis Hospital. I can help analyze injuries from images or answer medical questions. How can I assist you today?")
             return Response(str(resp), mimetype="application/xml")
 
-     
+        # Language handling
         language_map = {
             "en": ("en-US", "en-US-Wavenet-D"),
             "hi": ("hi-IN", "hi-IN-Wavenet-A"),
@@ -109,7 +218,7 @@ def whatsapp_reply():
                 incoming_msg = incoming_msg.replace(f"use {lang}", "").strip()
                 logger.info(f"Language set to {lang} for {sender_number}")
 
-       
+        # Audio response handling
         audio_keywords = ["send as audio", "voice response", "audio reply"]
         request_audio = any(keyword in incoming_msg.lower() for keyword in audio_keywords)
         if request_audio:
@@ -171,10 +280,10 @@ def whatsapp_reply():
             user_content = incoming_msg
             user_input_for_history = incoming_msg
 
-
+        # Determine if this is injury-related
         is_injury = has_image or is_injury_related(str(user_content), incoming_msg)
         
-      
+        # Select appropriate prompt
         if is_injury:
             system_prompt = VISION_PROMPT
             conversation_state[sender_number]['injury_consultations'] += 1
@@ -182,23 +291,24 @@ def whatsapp_reply():
         else:
             system_prompt = TEXT_PROMPT if not has_image else VISION_PROMPT
 
-      
+        # Build messages for AI
         messages = [{"role": "system", "content": system_prompt}]
         
-     
+        # Add conversation history
         for turn in conversation_state[sender_number]['history']:
             messages.append({"role": "user", "content": turn['user']})
             messages.append({"role": "assistant", "content": str(turn['assistant'])})
 
-       
+        # Add current message
         messages.append({"role": "user", "content": user_content})
 
- 
+        # Get AI response using streaming for injury analysis
         if is_injury and has_image:
             llm_response = analyze_injury_with_streaming(messages)
-       
+            # Save injury report
             save_injury_report(sender_number, user_input_for_history, llm_response, base64_image)
         else:
+            # Regular chat completion
             chat_completion = groq_client.chat.completions.create(
                 messages=messages,
                 model="meta-llama/llama-4-scout-17b-16e-instruct",
@@ -209,22 +319,23 @@ def whatsapp_reply():
 
         logger.info(f"LLM Response: {llm_response}")
 
-     
+        # Update conversation history
         conversation_state[sender_number]['history'].append({
             'user': user_input_for_history,
             'assistant': llm_response
         })
         
-       
+        # Keep only last 5 exchanges
         if len(conversation_state[sender_number]['history']) > 5:
             conversation_state[sender_number]['history'] = conversation_state[sender_number]['history'][-5:]
         
         conversation_state[sender_number]['last_interaction'] = datetime.now().isoformat()
 
+        # Prepare response
         resp = MessagingResponse()
         
         if request_audio:
-         
+            # Generate audio response
             audio_filename = f"response_{sender_number.replace(':', '_')}_{datetime.now().timestamp()}.mp3"
             lang = conversation_state[sender_number]['language']
             lang_code, voice_name = language_map.get(lang, ("en-US", "en-US-Wavenet-D"))
@@ -246,9 +357,9 @@ def whatsapp_reply():
             else:
                 resp.message("Sorry, I couldn't generate the audio response. Here's the text instead:\n" + llm_response)
         else:
-           
+            # Add injury consultation disclaimer if applicable
             if is_injury:
-                disclaimer = "\n\n⚠️ IMPORTANT: Visit Our Hospital for Proper diagnosis."
+                disclaimer = "\n\n⚠️ IMPORTANT: This is an AI assessment, not a medical diagnosis. Please consult a healthcare professional for proper medical evaluation."
                 resp.message(llm_response + disclaimer)
             else:
                 resp.message(llm_response)
@@ -259,7 +370,7 @@ def whatsapp_reply():
     except Exception as e:
         logger.error(f"Error processing request: {str(e)}", exc_info=True)
         resp = MessagingResponse()
-        resp.message("Sorry, I encountered an issue processing your request. Please try again or contact Symbiosis Hospital directly for urgent medical concerns or call +151-522-5303.")
+        resp.message("Sorry, I encountered an issue processing your request. Please try again or contact Symbiosis Hospital directly for urgent medical concerns.")
         return Response(str(resp), mimetype="application/xml")
 
 @app.route('/audio/<filename>')
