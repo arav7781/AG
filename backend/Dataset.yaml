@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 5
+names: ['Abrasions', 'Bruise', 'Burn', 'Cut', 'no abnormality']
+
+roboflow:
+  workspace: w-afwxp
+  project: wound-no-blister-2
+  version: 2
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/w-afwxp/wound-no-blister-2/dataset/2
